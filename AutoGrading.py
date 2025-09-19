@@ -12,6 +12,7 @@ from threading import Lock
 from typing import List, Optional, Dict, Any
 from gooey import Gooey, GooeyParser
 import wx.adv  # For wx.MessageDialog
+import shutil  # <-- added
 
 # Global lock for thread-safe file writes
 _file_write_lock: Lock = Lock()
@@ -102,6 +103,19 @@ class GradingFrame(wx.Frame):
         self.cleanup_current_processes()
         event.Skip()
 
+    def _build_command_for_path(self, path: str):
+        """
+        Build subprocess command for given path.
+        If path is a .dll, run via dotnet; otherwise return the path directly.
+        """
+        if path.lower().endswith('.dll'):
+            dotnet_path = shutil.which('dotnet')
+            if not dotnet_path:
+                wx.MessageBox("dotnet runtime not found in PATH. Please install .NET or ensure 'dotnet' is available.", "Error")
+                return None
+            return [dotnet_path, path]
+        return path
+
     def run_tests(self, args: GooeyParser) -> None:
         """
         Run all test cases and compare outputs with expected results.
@@ -115,7 +129,7 @@ class GradingFrame(wx.Frame):
         save_log_folder: str = args.save_log_folder
 
         if not os.path.exists(student_client_path) or not os.path.exists(student_server_path):
-            self.append_to_console("Selected executable files do not exist.\n")
+            self.append_to_console("Selected executable/DLL files do not exist.\n")
             return
 
         test_cases: List[Dict[str, str]] = []
@@ -167,8 +181,14 @@ class GradingFrame(wx.Frame):
                     open(student_server_record, 'w', encoding='utf-8', errors='replace').close()
 
                 try:
+                    client_cmd = self._build_command_for_path(student_client_path)
+                    server_cmd = self._build_command_for_path(student_server_path)
+                    if client_cmd is None or server_cmd is None:
+                        results.append({'test_case': test_case['name'], 'status': 'Failed to start', 'points': 0, 'reason': 'dotnet not available for DLL'})
+                        break
+
                     self.current_server_process = subprocess.Popen(
-                        student_server_path,
+                        server_cmd,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         stdin=subprocess.PIPE,
@@ -178,7 +198,7 @@ class GradingFrame(wx.Frame):
                     )
                     time.sleep(1.2)  # Allow server to initialize
                     self.current_client_process = subprocess.Popen(
-                        student_client_path,
+                        client_cmd,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         stdin=subprocess.PIPE,
@@ -282,22 +302,41 @@ class GradingFrame(wx.Frame):
         """
         Compare two files and return a diff if they differ.
 
-        Args:
-            file1 (str): Path to the expected output file.
-            file2 (str): Path to the actual output file.
-            label (str): Label for the output (e.g., 'Client' or 'Server').
+        This version normalizes outputs to avoid false negatives caused by:
+          - Different newline/flush behavior between .exe and .dll runs
+          - Prompts printed with or without trailing newline
+          - Extra whitespace or empty lines
 
-        Returns:
-            Optional[str]: A string containing the diff if files differ, None otherwise.
+        Normalization steps:
+          - Normalize CRLF to LF
+          - Remove occurrences of the interactive prompt:
+              "Enter ProductId to query (Press Enter to exit):"
+            (adjust this string if your prompt text is different)
+          - Collapse multiple whitespace into single spaces on each line
+          - Remove empty lines at the ends and in-between
         """
-        with open(file1, 'r', encoding='utf-8', errors='replace') as f1, \
-                open(file2, 'r', encoding='utf-8', errors='replace') as f2:
-            lines1: List[str] = [line.replace('\r\n', '\n').rstrip('\n') for line in f1.readlines()]
-            lines2: List[str] = [line.replace('\r\n', '\n').rstrip('\n') for line in f2.readlines()]
-            while lines1 and not lines1[-1]:
-                lines1.pop()
-            while lines2 and not lines2[-1]:
-                lines2.pop()
+        prompt = "Enter ProductId to query (Press Enter to exit):"
+
+        def read_and_normalize(path: str) -> List[str]:
+            with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                raw = fh.read()
+            # Normalize line endings
+            raw = raw.replace('\r\n', '\n').replace('\r', '\n')
+            # Remove the prompt everywhere (standalone or appended)
+            raw = raw.replace(prompt, '')
+            # Split into lines, collapse whitespace on each line, and drop empty lines
+            lines = []
+            for line in raw.split('\n'):
+                collapsed = ' '.join(line.split())  # collapse all whitespace
+                if collapsed != '':
+                    lines.append(collapsed)
+            # Trim trailing empty lines if any (shouldn't be any after filtering)
+            while lines and lines[-1] == '':
+                lines.pop()
+            return lines
+
+        lines1 = read_and_normalize(file1)
+        lines2 = read_and_normalize(file2)
 
         if lines1 == lines2:
             return None
@@ -310,15 +349,17 @@ class GradingFrame(wx.Frame):
             lineterm='\n'
         ))
         diff_str: str = ''.join(diff)
+        # limit diff length so logs don't explode
         return f"{label} mismatch:\n{diff_str[:2000]}"
+
 
 @Gooey(program_name="Auto Grading", default_size=(800, 600))
 def main() -> None:
     """Main function to set up the GUI and parse command-line arguments."""
     parser: GooeyParser = GooeyParser(description="Grade student client-server applications")
     parser.add_argument('test_cases_folder', help="Test Cases Folder", widget='DirChooser')
-    parser.add_argument('student_client', help="Student Client Executable", widget='FileChooser')
-    parser.add_argument('student_server', help="Student Server Executable", widget='FileChooser')
+    parser.add_argument('student_client', help="Student Client Executable or DLL", widget='FileChooser')
+    parser.add_argument('student_server', help="Student Server Executable or DLL", widget='FileChooser')
     parser.add_argument('save_log_folder', help="Save Log Folder", widget='DirChooser', default=os.getcwd())
     args: GooeyParser = parser.parse_args()
 

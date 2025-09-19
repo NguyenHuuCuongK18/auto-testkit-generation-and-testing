@@ -10,6 +10,7 @@ from threading import Lock
 from typing import List, Optional
 from gooey import Gooey, GooeyParser
 import wx.adv  # For wx.MessageDialog
+import shutil  # <-- added
 
 # Global lock for thread-safe file writes
 _file_write_lock: Lock = Lock()
@@ -73,6 +74,21 @@ class InteractiveFrame(wx.Frame):
         self.start_processes()
         self.Show()
 
+    def _build_command_for_path(self, path: str):
+        """
+        Build subprocess command for given path.
+        If path is a .dll, run via dotnet; otherwise return the path directly.
+        """
+        if path.lower().endswith('.dll'):
+            dotnet_path = shutil.which('dotnet')
+            if not dotnet_path:
+                wx.MessageBox("dotnet runtime not found in PATH. Please install .NET or ensure 'dotnet' is available.", "Error")
+                return None
+            # return a list (recommended) so Popen runs the command without a shell
+            return [dotnet_path, path]
+        # for exe or other executable, just return path (string or list acceptable)
+        return path
+
     def setup_folders(self) -> None:
         """Set up the folder structure for saving test case data and initialize record files."""
         test_case_folder: str = os.path.join(self.args.save_location, self.args.test_case_name)
@@ -101,13 +117,20 @@ class InteractiveFrame(wx.Frame):
         server_path: str = self.args.server_path
 
         if not os.path.exists(client_path) or not os.path.exists(server_path):
-            wx.MessageBox("Selected executable files do not exist.", "Error")
+            wx.MessageBox("Selected executable/DLL files do not exist.", "Error")
+            self.Close()
+            return
+
+        # Build commands (handle .dll through dotnet)
+        client_cmd = self._build_command_for_path(client_path)
+        server_cmd = self._build_command_for_path(server_path)
+        if client_cmd is None or server_cmd is None:
             self.Close()
             return
 
         try:
             self.server_process = subprocess.Popen(
-                server_path,
+                server_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE,
@@ -117,7 +140,7 @@ class InteractiveFrame(wx.Frame):
             )
             time.sleep(1.2)  # Allow server to initialize
             self.client_process = subprocess.Popen(
-                client_path,
+                client_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE,
@@ -299,8 +322,8 @@ class InteractiveFrame(wx.Frame):
 def main() -> None:
     """Main function to set up the GUI and parse command-line arguments."""
     parser: GooeyParser = GooeyParser(description="Generate test cases for client-server applications")
-    parser.add_argument('client_path', help="Client Executable", widget='FileChooser')
-    parser.add_argument('server_path', help="Server Executable", widget='FileChooser')
+    parser.add_argument('client_path', help="Client Executable or DLL", widget='FileChooser')
+    parser.add_argument('server_path', help="Server Executable or DLL", widget='FileChooser')
     parser.add_argument('test_case_name', help="Test Case Name")
     parser.add_argument('save_location', help="Save Location (directory)", widget='DirChooser', default=os.getcwd())
     args: GooeyParser = parser.parse_args()
